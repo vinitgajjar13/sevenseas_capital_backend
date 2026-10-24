@@ -1,23 +1,36 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 
 class Settings(BaseSettings):
+    """Application settings are loaded from environment variables or the local .env file.
+
+    Never place broker credentials in source code. Keep .env out of version control.
+    """
+
     app_name: str = "Sevenseas Capital API"
     environment: str = "development"
     secret_key: str = "change-me"
     database_url: str = "postgresql+asyncpg://sevenseas:sevenseas@localhost:5432/sevenseas"
     redis_url: str = "redis://localhost:6379/0"
-    groww_api_key: str = "eyJraWQiOiJaTUtjVXciLCJhbGciOiJFUzI1NiJ9.eyJleHAiOjI1Nzg4ODI5MTAsImlhdCI6MTc5MDQ4MjkxMCwibmJmIjoxNzkwNDgyOTEwLCJzdWIiOiJ7XCJ0b2tlblJlZklkXCI6XCJmM2VkM2I4YS03YmIxLTQyOTctODA3ZS1kZmZmMWU5MGYwZTBcIixcInZlbmRvckludGVncmF0aW9uS2V5XCI6XCJlMzFmZjIzYjA4NmI0MDZjODg3NGIyZjZkODQ5NTMxM1wiLFwidXNlckFjY291bnRJZFwiOlwiYzlhZjMwN2UtNzQyNC00OTczLTlhYmYtYWVjOWEwYTFlYjE3XCIsXCJkZXZpY2VJZFwiOlwiNGU2OTE1ZDctMDVmNy01NDkxLWFkODgtZjhhZWFkY2FiN2E0XCIsXCJzZXNzaW9uSWRcIjpcIjQ5ODIyMzZjLTYxYjktNGUyZC05NmFlLTA4OGY2ZGVlNjAyNVwiLFwiYWRkaXRpb25hbERhdGFcIjpcIno1NC9NZzltdjE2WXdmb0gvS0EwYkJKSktySGFvUVhLaXZ0RzJJNHhKcFZSTkczdTlLa2pWZDNoWjU1ZStNZERhWXBOVi9UOUxIRmtQejFFQisybTdRPT1cIixcInJvbGVcIjpcImF1dGgtdG90cFwiLFwic291cmNlSXBBZGRyZXNzXCI6XCIyNDA5OjQwYzE6MjAwYjozNzAxOmY1NmE6NzJiZDo4N2QyOjI3ZiwxNjIuMTU4LjIzNS4xMCwzNS4yNDEuMjMuMTIzXCIsXCJ0d29GYUV4cGlyeVRzXCI6MjU3ODg4MjkxMDUyNCxcInZlbmRvck5hbWVcIjpcImdyb3d3QXBpXCJ9IiwiaXNzIjoiYXBleC1hdXRoLXByb2QtYXBwIn0.D-evVPbnwrvoaK6MeM4z7h4xSy-aITyngxFTBeJwLrPwETurkci9N0kUYaVt1GmYT_lsDbIBqPwrX6Op3zX8kg"
-    groww_totp_token: str = "eyJraWQiOiJaTUtjVXciLCJhbGciOiJFUzI1NiJ9.eyJleHAiOjI1Nzg5MTY3MjYsImlhdCI6MTc5MDUxNjcyNiwibmJmIjoxNzkwNTE2NzI2LCJzdWIiOiJ7XCJ0b2tlblJlZklkXCI6XCI1OTY3N2I0MC03ZmNlLTQ2ZTMtYWE5MC0xMzViNDZiZTM4YzZcIixcInZlbmRvckludGVncmF0aW9uS2V5XCI6XCJlMzFmZjIzYjA4NmI0MDZjODg3NGIyZjZkODQ5NTMxM1wiLFwidXNlckFjY291bnRJZFwiOlwiYzlhZjMwN2UtNzQyNC00OTczLTlhYmYtYWVjOWEwYTFlYjE3XCIsXCJkZXZpY2VJZFwiOlwiNGU2OTE1ZDctMDVmNy01NDkxLWFkODgtZjhhZWFkY2FiN2E0XCIsXCJzZXNzaW9uSWRcIjpcIjg5ZGM2ZmQzLTIwYTUtNDk1My1hZjg2LTQ5YTJjNjk1NTQyZVwiLFwiYWRkaXRpb25hbERhdGFcIjpcIno1NC9NZzltdjE2WXdmb0gvS0EwYkJKSktySGFvUVhLaXZ0RzJJNHhKcFZSTkczdTlLa2pWZDNoWjU1ZStNZERhWXBOVi9UOUxIRmtQejFFQisybTdRPT1cIixcInJvbGVcIjpcImF1dGgtdG90cFwiLFwic291cmNlSXBBZGRyZXNzXCI6XCIyNDA5OjQwYzE6MjAxMDo2NjNkOjYzNGM6MTFjOTo0ZmMzOjc1M2EsMTcyLjcwLjIxOS4xNCwzNS4yNDEuMjMuMTIzXCIsXCJ0d29GYUV4cGlyeVRzXCI6MjU3ODkxNjcyNjk4MixcInZlbmRvck5hbWVcIjpcImdyb3d3QXBpXCJ9IiwiaXNzIjoiYXBleC1hdXRoLXByb2QtYXBwIn0.2HgOGGzSqQiolMAr1VOV6WfdyrzD0E5-oAOkdEvRBs512PHgOEoDX-mQkgSliDH0mRGjpCZv7-mj4eO0xvJNdA"
-    groww_totp_secret: str = "PLKE6K5MZRNAPMMM4DRZL7TMV7F4TZI7"
-    groww_api_secret: str = "p&nVDJP3K7VM_&M11nRrohtUxJM^9zzn"
+
+    # Broker credentials must be supplied via environment/.env.
+    groww_api_key: str = ""
+    groww_totp_token: str = ""
+    groww_totp_secret: str = ""
+    groww_api_secret: str = ""
     groww_redirect_url: str = "http://localhost:8000/api/v1/auth/groww/callback"
     groww_access_token: str = ""
-    cors_origins: str = "http://localhost:5173"
+
+    cors_origins: str = "http://localhost:3000,http://localhost:5173"
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
-    def cors_list(self): return [x.strip() for x in self.cors_origins.split(",") if x.strip()]
+    def cors_list(self) -> list[str]:
+        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
 
 @lru_cache
-def get_settings(): return Settings()
+def get_settings() -> Settings:
+    return Settings()
