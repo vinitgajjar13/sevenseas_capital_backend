@@ -14,6 +14,7 @@ from app.schemas.api import StockOut
 from app.services.live_state import LiveState
 from app.market_data.groww import GrowwService
 from app.routers.groww import router as groww_router, set_groww_service
+from app.routers.auth import router as auth_router
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ set_groww_service(groww)
 
 # Register Groww Router
 app.include_router(groww_router, prefix="/api/v1/groww", tags=["Groww API"])
+app.include_router(auth_router, prefix="/api/v1")
 
 
 async def background_market_poller():
