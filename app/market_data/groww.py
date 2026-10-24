@@ -160,21 +160,44 @@ class GrowwService:
         """Get Last Traded Price for symbols."""
         self.ensure_authenticated()
         ex = exchange.upper()
-        formatted_symbols = tuple(
-            f"{ex}_{s.upper()}" if not s.upper().startswith(f"{ex}_") else s.upper()
-            for s in symbols
-        )
-        return self.groww.get_ltp(exchange_trading_symbols=formatted_symbols, segment=segment.upper())
+        # Groww's LTP endpoint accepts up to 50 symbols per request.
+        # Split larger screens into compliant batches and merge the responses.
+        unique_symbols = list(dict.fromkeys(s.strip() for s in symbols if s and s.strip()))
+        result: dict[str, float] = {}
+        for offset in range(0, len(unique_symbols), 50):
+            batch = unique_symbols[offset : offset + 50]
+            formatted_symbols = tuple(
+                f"{ex}_{s.upper()}" if not s.upper().startswith(f"{ex}_") else s.upper()
+                for s in batch
+            )
+            result.update(
+                self.groww.get_ltp(
+                    exchange_trading_symbols=formatted_symbols,
+                    segment=segment.upper(),
+                )
+            )
+        return result
 
     def get_ohlc(self, symbols: list[str], exchange: str = "NSE", segment: str = "CASH") -> dict[str, Any]:
         """Get Day's OHLC for symbols."""
         self.ensure_authenticated()
         ex = exchange.upper()
-        formatted_symbols = tuple(
-            f"{ex}_{s.upper()}" if not s.upper().startswith(f"{ex}_") else s.upper()
-            for s in symbols
-        )
-        return self.groww.get_ohlc(exchange_trading_symbols=formatted_symbols, segment=segment.upper())
+        # Keep OHLC requests aligned with Groww's 50-symbol batch limit.
+        unique_symbols = list(dict.fromkeys(s.strip() for s in symbols if s and s.strip()))
+        result: dict[str, Any] = {}
+        for offset in range(0, len(unique_symbols), 50):
+            batch = unique_symbols[offset : offset + 50]
+            formatted_symbols = tuple(
+                f"{ex}_{s.upper()}" if not s.upper().startswith(f"{ex}_") else s.upper()
+                for s in batch
+            )
+            result.update(
+                self.groww.get_ohlc(
+                    exchange_trading_symbols=formatted_symbols,
+                    segment=segment.upper(),
+                )
+            )
+        return result
 
     def historical(
         self,

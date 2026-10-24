@@ -1,8 +1,9 @@
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +16,35 @@ from app.market_data.groww import GrowwService
 from app.routers.groww import router as groww_router, set_groww_service
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_ohlc(value):
+    """Normalize Groww SDK OHLC responses, which may be dicts or serialized strings."""
+    parsed = value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            parsed = {}
+            for field in ("open", "high", "low", "close", "volume"):
+                match = re.search(
+                    rf"{field}\s*:\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+))",
+                    value,
+                    re.IGNORECASE,
+                )
+                if match:
+                    parsed[field] = match.group(1)
+    if not isinstance(parsed, dict):
+        return {}
+    normalized = {}
+    for field in ("open", "high", "low", "close", "volume"):
+        raw = parsed.get(field)
+        try:
+            normalized[field] = float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            normalized[field] = None
+    return normalized
+
 
 settings = get_settings()
 app = FastAPI(
@@ -107,6 +137,174 @@ async def stocks(db: AsyncSession = Depends(get_db)):
             select(Stock).where(Stock.active == True).order_by(Stock.symbol)
         )
     ).all()
+
+
+@app.get("/api/v1/market/overview")
+async def market_overview(
+    limit: int = Query(250, ge=1, le=500, description="Maximum active stocks to include"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return real Groww LTP/OHLC data joined to the configured stock and sector universe.
+
+    Strategy scores and signals are intentionally not fabricated here; this endpoint
+    only returns values supplied by Groww plus simple change calculations from OHLC.
+    """
+    from app.db.models import Sector
+
+    stocks = (
+        await db.scalars(
+            select(Stock).where(Stock.active == True).order_by(Stock.symbol).limit(limit)
+        )
+    ).all()
+    if not stocks:
+        return {
+            "source": "groww",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "total_stocks": 0,
+            "advances": 0,
+            "declines": 0,
+            "unchanged": 0,
+            "stocks": [],
+            "sectors": [],
+        }
+
+    symbols = [
+        (s.groww_symbol or s.symbol).replace("NSE-", "").replace("BSE-", "").strip().upper()
+        for s in stocks
+    ]
+    try:
+        ltp_map, ohlc_map = await asyncio.gather(
+            asyncio.to_thread(groww.get_ltp, symbols=symbols, exchange="NSE", segment="CASH"),
+            asyncio.to_thread(groww.get_ohlc, symbols=symbols, exchange="NSE", segment="CASH"),
+        )
+    except Exception as exc:
+        logger.warning("Groww market overview request failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Groww market data is unavailable; check Groww authentication and instrument symbols.")
+
+    sectors = (await db.scalars(select(Sector).where(Sector.active == True))).all()
+    sector_names = {sector.id: sector.name for sector in sectors}
+    items = []
+    advances = declines = unchanged = 0
+    sector_stats = {}
+
+    for stock in stocks:
+        symbol = (stock.groww_symbol or stock.symbol).replace("NSE-", "").replace("BSE-", "").strip().upper()
+        key = f"NSE_{symbol}"
+        ltp = ltp_map.get(key, ltp_map.get(symbol))
+        bar = _normalize_ohlc(ohlc_map.get(key, ohlc_map.get(symbol, {})) or {})
+        close = bar.get("close")
+        change = round(float(ltp) - float(close), 4) if ltp is not None and close not in (None, 0) else None
+        change_pct = round(change / float(close) * 100, 4) if change is not None and close not in (None, 0) else None
+        if change_pct is not None and change_pct > 0:
+            advances += 1
+        elif change_pct is not None and change_pct < 0:
+            declines += 1
+        elif change_pct == 0:
+            unchanged += 1
+
+        sector_name = sector_names.get(stock.sector_id, "Unclassified")
+        item = {
+            "id": stock.id,
+            "symbol": stock.symbol,
+            "name": stock.name,
+            "sector_id": stock.sector_id,
+            "sector": sector_name,
+            "exchange": stock.exchange or "NSE",
+            "groww_symbol": stock.groww_symbol,
+            "groww_exchange_token": stock.groww_exchange_token,
+            "ltp": float(ltp) if ltp is not None else None,
+            "change": change,
+            "change_percent": change_pct,
+            "open": bar.get("open"),
+            "high": bar.get("high"),
+            "low": bar.get("low"),
+            "previous_close": close,
+            "volume": bar.get("volume"),
+            "data_source": "groww" if ltp is not None else "unavailable",
+        }
+        items.append(item)
+
+        stat = sector_stats.setdefault(sector_name, {"sector": sector_name, "total": 0, "advances": 0, "declines": 0, "unchanged": 0, "average_change_percent": 0.0, "_changes": []})
+        stat["total"] += 1
+        if change_pct is not None:
+            stat["_changes"].append(change_pct)
+            if change_pct > 0:
+                stat["advances"] += 1
+            elif change_pct < 0:
+                stat["declines"] += 1
+            else:
+                stat["unchanged"] += 1
+
+    sector_list = []
+    for stat in sector_stats.values():
+        changes = stat.pop("_changes")
+        stat["average_change_percent"] = round(sum(changes) / len(changes), 4) if changes else None
+        sector_list.append(stat)
+    sector_list.sort(key=lambda item: (item["average_change_percent"] is not None, item["average_change_percent"] or 0), reverse=True)
+
+    return {
+        "source": "groww",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "total_stocks": len(items),
+        "advances": advances,
+        "declines": declines,
+        "unchanged": unchanged,
+        "sectors": sector_list,
+        "stocks": items,
+    }
+
+
+@app.get("/api/v1/market/indices")
+async def market_indices():
+    """Fetch current Groww quotes for the three index cards shown in the frontend."""
+    specifications = [
+        ("nifty50", "NIFTY 50", "NIFTY", "NSE"),
+        ("bankNifty", "BANK NIFTY", "BANKNIFTY", "NSE"),
+        ("sensex", "SENSEX", "SENSEX", "BSE"),
+    ]
+
+    async def fetch_one(key, name, symbol, exchange):
+        try:
+            quote = await asyncio.to_thread(
+                groww.get_quote,
+                symbol=symbol,
+                exchange=exchange,
+                segment="CASH",
+            )
+            price = quote.get("last_price")
+            if price is None:
+                return key, None
+            ohlc = _normalize_ohlc(quote.get("ohlc") or {})
+            previous_close = ohlc.get("close")
+            change = quote.get("day_change")
+            change_percent = quote.get("day_change_perc")
+            if change is None and previous_close not in (None, 0):
+                change = float(price) - float(previous_close)
+            if change_percent is None and previous_close not in (None, 0) and change is not None:
+                change_percent = float(change) / float(previous_close) * 100
+            return key, {
+                "name": name,
+                "symbol": symbol,
+                "exchange": exchange,
+                "last_price": float(price),
+                "day_change": float(change) if change is not None else 0.0,
+                "day_change_perc": float(change_percent) if change_percent is not None else 0.0,
+                "ohlc": ohlc,
+                "volume": quote.get("volume"),
+                "data_source": "groww",
+            }
+        except Exception as exc:
+            logger.info("Groww index quote unavailable for %s: %s", symbol, exc)
+            return key, None
+
+    results = await asyncio.gather(
+        *(fetch_one(*specification) for specification in specifications)
+    )
+    return {
+        "source": "groww",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "indices": {key: value for key, value in results if value is not None},
+    }
 
 
 @app.get("/api/v1/stocks/{symbol}")
