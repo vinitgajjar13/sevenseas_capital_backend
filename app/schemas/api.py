@@ -3,7 +3,14 @@ from pydantic import BaseModel, ConfigDict
 
 class StockOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-    id: int; symbol: str; name: str; sector_id: int; exchange: str; instrument_token: int | None
+    id: int
+    symbol: str
+    name: str
+    sector_id: int
+    exchange: str
+    instrument_token: int | None = None
+    groww_exchange_token: int | None = None
+    groww_symbol: str | None = None
 
 class TickOut(BaseModel):
     symbol: str; price: float; change_pct: float | None = None; volume: int | None = None; timestamp: datetime
