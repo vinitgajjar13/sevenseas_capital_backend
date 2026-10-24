@@ -1,3 +1,4 @@
+from app.services.market_calendar import get_market_status, is_market_open, now_ist
 import asyncio
 import json
 import logging
@@ -73,21 +74,24 @@ app.include_router(auth_router, prefix="/api/v1")
 
 async def background_market_poller():
     """
-    Background worker that continuously pulls real-time LTP quotes from Groww API
-    and broadcasts them into LiveState so all connected WebSocket clients receive
-    live market prices.
+    Background worker that continuously pulls real-time quotes or official closing prices
+    from Groww API and broadcasts them into LiveState so all connected WebSocket clients
+    receive verified market prices with clear priceType (LIVE vs LAST_CLOSE) indicators.
     """
     await asyncio.sleep(2)
-    logger.info("Starting background Groww market poller...")
+    logger.info("Starting background Groww market poller with market status awareness...")
     
     while True:
         try:
             # Only poll if there are connected WebSocket clients
             if live.subscriber_count > 0:
+                status_info = get_market_status()
+                is_open = status_info["marketStatus"] == "OPEN"
+
                 async with SessionLocal() as db:
                     stocks = (
                         await db.scalars(
-                            select(Stock).where(Stock.active == True).limit(40)
+                            select(Stock).where(Stock.active == True).limit(50)
                         )
                     ).all()
 
@@ -96,7 +100,8 @@ async def background_market_poller():
                     token_map = {s.symbol.upper(): (s.groww_exchange_token or s.instrument_token or s.symbol) for s in stocks}
 
                     try:
-                        ltp_map = await asyncio.to_thread(groww.get_ltp, symbols=symbols, exchange="NSE", segment="CASH")
+                        batch_res = await groww.get_batch_prices_cached(symbols=symbols, exchange="NSE", segment="CASH")
+                        ltp_map = batch_res.get("ltp", {})
                         for raw_key, price in ltp_map.items():
                             sym = raw_key.replace("NSE_", "").upper()
                             token = token_map.get(sym, sym)
@@ -106,11 +111,17 @@ async def background_market_poller():
                                 "symbol": sym,
                                 "last_price": price,
                                 "ltp": price,
+                                "marketStatus": status_info["marketStatus"],
+                                "priceType": status_info["priceType"],
                             })
                     except Exception as e:
                         logger.debug(f"Background LTP poll error: {e}")
 
-            await asyncio.sleep(5)
+                # If market is closed, sleep longer (20s) to avoid unnecessary polling; if open, 5s
+                sleep_sec = 5 if is_open else 20
+                await asyncio.sleep(sleep_sec)
+            else:
+                await asyncio.sleep(5)
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -125,6 +136,24 @@ async def startup():
 
     # Start background poller task
     asyncio.create_task(background_market_poller())
+
+
+@app.get("/api/v1/market/status")
+async def market_status():
+    """Get market trading calendar status (live vs last close)."""
+    return get_market_status()
+
+
+@app.get("/api/v1/market/indices")
+async def market_indices():
+    """Get NIFTY 50, BANK NIFTY, SENSEX with official closing/live prices using Redis cache."""
+    return await groww.get_indices_cached()
+
+
+@app.get("/api/v1/market/cache/metrics")
+async def market_cache_metrics():
+    """Get cache performance telemetry and hit ratio."""
+    return await groww.cache.get_metrics()
 
 
 @app.get("/health")
@@ -175,10 +204,9 @@ async def market_overview(
         for s in stocks
     ]
     try:
-        ltp_map, ohlc_map = await asyncio.gather(
-            asyncio.to_thread(groww.get_ltp, symbols=symbols, exchange="NSE", segment="CASH"),
-            asyncio.to_thread(groww.get_ohlc, symbols=symbols, exchange="NSE", segment="CASH"),
-        )
+        batch_res = await groww.get_batch_prices_cached(symbols=symbols, exchange="NSE", segment="CASH")
+        ltp_map = batch_res.get("ltp", {})
+        ohlc_map = await groww.get_ohlc_cached(symbols=symbols, exchange="NSE", segment="CASH")
     except Exception as exc:
         logger.warning("Groww market overview request failed: %s", exc)
         raise HTTPException(status_code=502, detail="Groww market data is unavailable; check Groww authentication and instrument symbols.")
@@ -256,57 +284,7 @@ async def market_overview(
     }
 
 
-@app.get("/api/v1/market/indices")
-async def market_indices():
-    """Fetch current Groww quotes for the three index cards shown in the frontend."""
-    specifications = [
-        ("nifty50", "NIFTY 50", "NIFTY", "NSE"),
-        ("bankNifty", "BANK NIFTY", "BANKNIFTY", "NSE"),
-        ("sensex", "SENSEX", "SENSEX", "BSE"),
-    ]
 
-    async def fetch_one(key, name, symbol, exchange):
-        try:
-            quote = await asyncio.to_thread(
-                groww.get_quote,
-                symbol=symbol,
-                exchange=exchange,
-                segment="CASH",
-            )
-            price = quote.get("last_price")
-            if price is None:
-                return key, None
-            ohlc = _normalize_ohlc(quote.get("ohlc") or {})
-            previous_close = ohlc.get("close")
-            change = quote.get("day_change")
-            change_percent = quote.get("day_change_perc")
-            if change is None and previous_close not in (None, 0):
-                change = float(price) - float(previous_close)
-            if change_percent is None and previous_close not in (None, 0) and change is not None:
-                change_percent = float(change) / float(previous_close) * 100
-            return key, {
-                "name": name,
-                "symbol": symbol,
-                "exchange": exchange,
-                "last_price": float(price),
-                "day_change": float(change) if change is not None else 0.0,
-                "day_change_perc": float(change_percent) if change_percent is not None else 0.0,
-                "ohlc": ohlc,
-                "volume": quote.get("volume"),
-                "data_source": "groww",
-            }
-        except Exception as exc:
-            logger.info("Groww index quote unavailable for %s: %s", symbol, exc)
-            return key, None
-
-    results = await asyncio.gather(
-        *(fetch_one(*specification) for specification in specifications)
-    )
-    return {
-        "source": "groww",
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "indices": {key: value for key, value in results if value is not None},
-    }
 
 
 @app.get("/api/v1/stocks/{symbol}")
@@ -355,8 +333,16 @@ async def market_ws(ws: WebSocket):
     await ws.accept()
     q = live.subscribe()
     try:
-        # Send initial connection handshake
-        await ws.send_text(json.dumps({"type": "connected", "service": "sevenseas-market-feed"}))
+        status_info = get_market_status()
+        # Send initial connection handshake with market status & priceType metadata
+        await ws.send_text(json.dumps({
+            "type": "connected",
+            "service": "sevenseas-market-feed",
+            "marketStatus": status_info["marketStatus"],
+            "priceType": status_info["priceType"],
+            "reason": status_info["reason"],
+            "lastTradingSessionDate": status_info["lastTradingSessionDate"],
+        }))
         while True:
             try:
                 msg = await asyncio.wait_for(q.get(), timeout=20.0)

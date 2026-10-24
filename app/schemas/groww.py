@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 from pydantic import BaseModel, Field
 
 
@@ -66,27 +66,72 @@ class GrowwQuoteResponse(BaseModel):
     exchange: str
     segment: str
     last_price: Optional[float] = None
+    price: Optional[float] = None
+    previousClose: Optional[float] = None
     day_change: Optional[float] = None
     day_change_perc: Optional[float] = None
+    marketStatus: Optional[str] = "CLOSED"
+    priceType: Optional[str] = "LAST_CLOSE"
+    lastUpdated: Optional[str] = None
     ohlc: Optional[dict[str, Any]] = None
     depth: Optional[dict[str, Any]] = None
     volume: Optional[int] = None
     week_52_high: Optional[float] = None
     week_52_low: Optional[float] = None
+    isStale: Optional[bool] = False
+    staleReason: Optional[str] = None
     raw: Optional[dict[str, Any]] = None
+
+
+class StockPriceItem(BaseModel):
+    symbol: str
+    price: Optional[float] = None
+    previousClose: Optional[float] = None
+    change: Optional[float] = None
+    changePercent: Optional[float] = None
+    open: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
+    volume: Optional[int] = None
+    lastUpdated: Optional[str] = None
+    marketStatus: str = "CLOSED"
+    priceType: str = "LAST_CLOSE"
+    isStale: Optional[bool] = False
+    staleReason: Optional[str] = None
 
 
 class GrowwLtpResponse(BaseModel):
     ltp: dict[str, float]
+    marketStatus: Optional[str] = "CLOSED"
+    priceType: Optional[str] = "LAST_CLOSE"
+    lastUpdated: Optional[str] = None
+    isStale: Optional[bool] = False
+    staleReason: Optional[str] = None
+    quotes: Optional[Dict[str, StockPriceItem]] = None
+
+
+class MarketPricesResponse(BaseModel):
+    marketStatus: str
+    priceType: str
+    lastUpdated: str
+    isStale: Optional[bool] = False
+    staleReason: Optional[str] = None
+    prices: Dict[str, StockPriceItem]
+    quotes: Optional[Dict[str, StockPriceItem]] = None
+    ltp: Optional[Dict[str, float]] = None
 
 
 class GrowwOhlcResponse(BaseModel):
     ohlc: dict[str, dict[str, Any]]
+    isStale: Optional[bool] = False
+    staleReason: Optional[str] = None
 
 
 class GrowwHistoricalResponse(BaseModel):
     symbol: str
     candle_interval: str
+    isStale: Optional[bool] = False
+    staleReason: Optional[str] = None
     candles: list[Any] = []
 
 
@@ -106,3 +151,65 @@ class GrowwPlaceOrderRequest(BaseModel):
 class GrowwPlaceOrderResponse(BaseModel):
     status: str
     data: dict[str, Any]
+
+
+class MarketTradingHours(BaseModel):
+    open: str = "09:15:00"
+    close: str = "15:30:00"
+    timezone: str = "Asia/Kolkata"
+    exchange: str = "NSE/BSE"
+
+
+class MarketStatusResponse(BaseModel):
+    marketStatus: str
+    priceType: str
+    reason: str
+    currentTime: str
+    isTradingDay: bool
+    holidayName: Optional[str] = None
+    lastTradingSessionDate: str
+    previousTradingSessionDate: str
+    nextTradingSessionTime: Optional[str] = None
+    tradingHours: MarketTradingHours = MarketTradingHours()
+
+
+class MarketIndexQuote(BaseModel):
+    name: str
+    symbol: str
+    price: Optional[float] = None
+    previousClose: Optional[float] = None
+    change: Optional[float] = None
+    changePercent: Optional[float] = None
+    open: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
+    week52High: Optional[float] = None
+    week52Low: Optional[float] = None
+    marketStatus: str = "CLOSED"
+    priceType: str = "LAST_CLOSE"
+    lastUpdated: Optional[str] = None
+    isStale: Optional[bool] = False
+    staleReason: Optional[str] = None
+    constituents: Optional[list[dict[str, Any]]] = None
+
+
+class MarketIndicesResponse(BaseModel):
+    marketStatus: str
+    priceType: str
+    lastUpdated: str
+    isStale: Optional[bool] = False
+    staleReason: Optional[str] = None
+    indices: Dict[str, MarketIndexQuote]
+
+
+class CacheMetricsResponse(BaseModel):
+    hits: int
+    misses: int
+    stale_hits: int
+    redis_errors: int
+    api_calls_saved: int
+    hit_ratio: float
+    redis_available: bool
+    redis_memory_used: Optional[str] = None
+    uptime_seconds: float
+    keys_count: Optional[int] = None
