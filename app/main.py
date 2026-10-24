@@ -254,6 +254,59 @@ async def market_overview(
     }
 
 
+@app.get("/api/v1/market/indices")
+async def market_indices():
+    """Fetch current Groww quotes for the three index cards shown in the frontend."""
+    specifications = [
+        ("nifty50", "NIFTY 50", "NIFTY", "NSE"),
+        ("bankNifty", "BANK NIFTY", "BANKNIFTY", "NSE"),
+        ("sensex", "SENSEX", "SENSEX", "BSE"),
+    ]
+
+    async def fetch_one(key, name, symbol, exchange):
+        try:
+            quote = await asyncio.to_thread(
+                groww.get_quote,
+                symbol=symbol,
+                exchange=exchange,
+                segment="CASH",
+            )
+            price = quote.get("last_price")
+            if price is None:
+                return key, None
+            ohlc = _normalize_ohlc(quote.get("ohlc") or {})
+            previous_close = ohlc.get("close")
+            change = quote.get("day_change")
+            change_percent = quote.get("day_change_perc")
+            if change is None and previous_close not in (None, 0):
+                change = float(price) - float(previous_close)
+            if change_percent is None and previous_close not in (None, 0) and change is not None:
+                change_percent = float(change) / float(previous_close) * 100
+            return key, {
+                "name": name,
+                "symbol": symbol,
+                "exchange": exchange,
+                "last_price": float(price),
+                "day_change": float(change) if change is not None else 0.0,
+                "day_change_perc": float(change_percent) if change_percent is not None else 0.0,
+                "ohlc": ohlc,
+                "volume": quote.get("volume"),
+                "data_source": "groww",
+            }
+        except Exception as exc:
+            logger.info("Groww index quote unavailable for %s: %s", symbol, exc)
+            return key, None
+
+    results = await asyncio.gather(
+        *(fetch_one(*specification) for specification in specifications)
+    )
+    return {
+        "source": "groww",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "indices": {key: value for key, value in results if value is not None},
+    }
+
+
 @app.get("/api/v1/stocks/{symbol}")
 async def stock(symbol: str, db: AsyncSession = Depends(get_db)):
     s = await db.scalar(select(Stock).where(Stock.symbol == symbol.upper()))
