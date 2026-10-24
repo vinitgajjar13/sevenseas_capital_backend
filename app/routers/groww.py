@@ -5,6 +5,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import Stock
 from app.db.session import get_db
 from app.market_data.groww import GrowwService
+from app.services.market_calendar import get_market_status, now_ist
+from app.services.market_cache import get_market_cache
 from app.schemas.groww import (
     GrowwAuthResponse,
     GrowwAuthStatusResponse,
@@ -19,6 +21,10 @@ from app.schemas.groww import (
     GrowwHistoricalResponse,
     GrowwPlaceOrderRequest,
     GrowwPlaceOrderResponse,
+    MarketStatusResponse,
+    MarketIndicesResponse,
+    MarketPricesResponse,
+    CacheMetricsResponse,
 )
 
 router = APIRouter()
@@ -161,6 +167,50 @@ async def groww_cancel_order(
 
 # --- 4. Market Data Endpoints ---
 
+@router.get("/market/status", response_model=MarketStatusResponse, summary="Get Indian exchange trading hours and calendar status")
+async def groww_market_status():
+    """
+    Determine whether the Indian stock market is currently OPEN (regular trading hours 09:15-15:30 IST)
+    or CLOSED (weekend, trading holiday, pre-market, or after-hours), indicating whether live quotes
+    or official last session closing prices apply.
+    """
+    return get_market_status()
+
+
+@router.get("/market/indices", response_model=MarketIndicesResponse, summary="Get NIFTY 50, BANK NIFTY, SENSEX benchmarks")
+async def groww_market_indices(groww: GrowwService = Depends(get_groww_service)):
+    """
+    Get real benchmark indices from Groww (NIFTY 50, BANK NIFTY, SENSEX) displaying official closing prices
+    when market is closed or live prices during market hours.
+    """
+    try:
+        return await groww.get_indices_cached()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch market indices: {e}")
+
+
+@router.get("/market/prices", response_model=MarketPricesResponse, summary="Get structured batch quotes with live vs closing price metadata")
+async def groww_market_prices(
+    symbols: str = Query(..., description="Comma-separated trading symbols (e.g. WIPRO,INFY,RELIANCE)"),
+    exchange: str = Query("NSE", description="Exchange: NSE or BSE"),
+    segment: str = Query("CASH", description="Segment: CASH or FNO"),
+    groww: GrowwService = Depends(get_groww_service),
+):
+    """
+    Get batch stock quotes with clear price, previousClose, priceType (LIVE or LAST_CLOSE),
+    marketStatus, and lastUpdated metadata.
+    """
+    try:
+        sym_list = [s.strip() for s in symbols.split(",") if s.strip()]
+        if not sym_list:
+            raise HTTPException(status_code=400, detail="No symbols provided")
+        return await groww.get_batch_prices_cached(symbols=sym_list, exchange=exchange, segment=segment)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.get("/market/quote/{symbol}", response_model=GrowwQuoteResponse, summary="Get full real-time quote for a symbol")
 async def groww_market_quote(
     symbol: str,
@@ -169,7 +219,7 @@ async def groww_market_quote(
     groww: GrowwService = Depends(get_groww_service),
 ):
     try:
-        return groww.get_quote(symbol=symbol, exchange=exchange, segment=segment)
+        return await groww.get_quote_cached(symbol=symbol, exchange=exchange, segment=segment)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -185,8 +235,7 @@ async def groww_market_ltp(
         sym_list = [s.strip() for s in symbols.split(",") if s.strip()]
         if not sym_list:
             raise HTTPException(status_code=400, detail="No symbols provided")
-        res = groww.get_ltp(symbols=sym_list, exchange=exchange, segment=segment)
-        return {"ltp": res}
+        return await groww.get_batch_prices_cached(symbols=sym_list, exchange=exchange, segment=segment)
     except HTTPException:
         raise
     except Exception as e:
@@ -204,7 +253,7 @@ async def groww_market_ohlc(
         sym_list = [s.strip() for s in symbols.split(",") if s.strip()]
         if not sym_list:
             raise HTTPException(status_code=400, detail="No symbols provided")
-        res = groww.get_ohlc(symbols=sym_list, exchange=exchange, segment=segment)
+        res = await groww.get_ohlc_cached(symbols=sym_list, exchange=exchange, segment=segment)
         return {"ohlc": res}
     except HTTPException:
         raise
@@ -226,7 +275,7 @@ async def groww_market_historical(
     groww: GrowwService = Depends(get_groww_service),
 ):
     try:
-        res = groww.historical(
+        res = await groww.historical_cached(
             groww_symbol=symbol,
             start_time=start_time,
             end_time=end_time,
@@ -238,6 +287,8 @@ async def groww_market_historical(
             "symbol": symbol,
             "candle_interval": candle_interval,
             "candles": res.get("candles", []),
+            "isStale": res.get("isStale", False),
+            "staleReason": res.get("staleReason"),
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -309,9 +360,13 @@ async def groww_sectors_overview(
         if include_ltp and sec_stocks:
             try:
                 symbols = [st.groww_symbol.replace("NSE-", "") if st.groww_symbol else st.symbol for st in sec_stocks]
-                ltp_map = groww.get_ltp(symbols=symbols, exchange="NSE", segment="CASH")
+                batch_res = await groww.get_batch_prices_cached(symbols=symbols, exchange="NSE", segment="CASH")
+                ltp_map = batch_res.get("ltp", {})
             except Exception:
                 ltp_map = {}
+
+        status_info = get_market_status()
+        last_updated = now_ist().isoformat() if status_info["marketStatus"] == "OPEN" else f"{status_info['lastTradingSessionDate']}T15:30:00+05:30"
 
         for st in sec_stocks:
             sym_key = st.groww_symbol.replace("NSE-", "") if st.groww_symbol else st.symbol
@@ -324,6 +379,10 @@ async def groww_sectors_overview(
                 "groww_exchange_token": st.groww_exchange_token,
                 "exchange": st.exchange,
                 "ltp": price,
+                "price": price,
+                "priceType": status_info["priceType"],
+                "marketStatus": status_info["marketStatus"],
+                "lastUpdated": last_updated,
             })
 
         result.append({
@@ -339,3 +398,20 @@ async def groww_sectors_overview(
         "sectors": result,
     }
 
+
+
+# --- 7. Cache Metrics & Maintenance Endpoints ---
+
+@router.get("/cache/metrics", response_model=CacheMetricsResponse, summary="Get market cache metrics, hit ratio, and Redis telemetry")
+async def groww_cache_metrics():
+    """Retrieve cache performance metrics, hit ratio, saved broker API calls, and Redis health."""
+    cache = get_market_cache()
+    return await cache.get_metrics()
+
+
+@router.post("/cache/clear", summary="Clear market cache keys by pattern")
+async def groww_cache_clear(pattern: str = Query("sq:*", description="Redis key pattern to clear")):
+    """Clear keys from Redis and in-memory cache."""
+    cache = get_market_cache()
+    deleted = await cache.clear(pattern=pattern)
+    return {"status": "success", "cleared_keys": deleted, "pattern": pattern}

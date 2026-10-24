@@ -24,6 +24,16 @@ class Settings(BaseSettings):
 
     cors_origins: str = "http://localhost:3000,http://localhost:5173"
 
+    # Cache Configuration & TTLs (in seconds)
+    cache_enabled: bool = True
+    cache_ttl_live_price: int = 2          # 1-3 seconds for live stock prices and LTP
+    cache_ttl_indices: int = 5             # 5-10 seconds for market indices
+    cache_ttl_ohlc: int = 60               # 1 minute for intraday OHLC
+    cache_ttl_historical: int = 600        # 10 minutes (5-15 min) for historical candles
+    cache_ttl_market_closed: int = 300     # 5 minutes when market is closed
+    cache_ttl_last_close: int = 86400      # 24 hours for verified session closes
+    cache_stale_retention: int = 604800    # 7 days for last-known fallback data
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
