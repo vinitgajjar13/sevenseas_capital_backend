@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -107,6 +107,121 @@ async def stocks(db: AsyncSession = Depends(get_db)):
             select(Stock).where(Stock.active == True).order_by(Stock.symbol)
         )
     ).all()
+
+
+@app.get("/api/v1/market/overview")
+async def market_overview(
+    limit: int = Query(250, ge=1, le=500, description="Maximum active stocks to include"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return real Groww LTP/OHLC data joined to the configured stock and sector universe.
+
+    Strategy scores and signals are intentionally not fabricated here; this endpoint
+    only returns values supplied by Groww plus simple change calculations from OHLC.
+    """
+    from app.db.models import Sector
+
+    stocks = (
+        await db.scalars(
+            select(Stock).where(Stock.active == True).order_by(Stock.symbol).limit(limit)
+        )
+    ).all()
+    if not stocks:
+        return {
+            "source": "groww",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "total_stocks": 0,
+            "advances": 0,
+            "declines": 0,
+            "unchanged": 0,
+            "stocks": [],
+            "sectors": [],
+        }
+
+    symbols = [
+        (s.groww_symbol or s.symbol).replace("NSE-", "").replace("BSE-", "").strip().upper()
+        for s in stocks
+    ]
+    try:
+        ltp_map, ohlc_map = await asyncio.gather(
+            asyncio.to_thread(groww.get_ltp, symbols=symbols, exchange="NSE", segment="CASH"),
+            asyncio.to_thread(groww.get_ohlc, symbols=symbols, exchange="NSE", segment="CASH"),
+        )
+    except Exception as exc:
+        logger.warning("Groww market overview request failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Groww market data is unavailable; check Groww authentication and instrument symbols.")
+
+    sectors = (await db.scalars(select(Sector).where(Sector.active == True))).all()
+    sector_names = {sector.id: sector.name for sector in sectors}
+    items = []
+    advances = declines = unchanged = 0
+    sector_stats = {}
+
+    for stock in stocks:
+        symbol = (stock.groww_symbol or stock.symbol).replace("NSE-", "").replace("BSE-", "").strip().upper()
+        key = f"NSE_{symbol}"
+        ltp = ltp_map.get(key, ltp_map.get(symbol))
+        bar = ohlc_map.get(key, ohlc_map.get(symbol, {})) or {}
+        close = bar.get("close")
+        change = round(float(ltp) - float(close), 4) if ltp is not None and close not in (None, 0) else None
+        change_pct = round(change / float(close) * 100, 4) if change is not None and close not in (None, 0) else None
+        if change_pct is not None and change_pct > 0:
+            advances += 1
+        elif change_pct is not None and change_pct < 0:
+            declines += 1
+        elif change_pct == 0:
+            unchanged += 1
+
+        sector_name = sector_names.get(stock.sector_id, "Unclassified")
+        item = {
+            "id": stock.id,
+            "symbol": stock.symbol,
+            "name": stock.name,
+            "sector_id": stock.sector_id,
+            "sector": sector_name,
+            "exchange": stock.exchange or "NSE",
+            "groww_symbol": stock.groww_symbol,
+            "groww_exchange_token": stock.groww_exchange_token,
+            "ltp": float(ltp) if ltp is not None else None,
+            "change": change,
+            "change_percent": change_pct,
+            "open": bar.get("open"),
+            "high": bar.get("high"),
+            "low": bar.get("low"),
+            "previous_close": close,
+            "volume": bar.get("volume"),
+            "data_source": "groww" if ltp is not None else "unavailable",
+        }
+        items.append(item)
+
+        stat = sector_stats.setdefault(sector_name, {"sector": sector_name, "total": 0, "advances": 0, "declines": 0, "unchanged": 0, "average_change_percent": 0.0, "_changes": []})
+        stat["total"] += 1
+        if change_pct is not None:
+            stat["_changes"].append(change_pct)
+            if change_pct > 0:
+                stat["advances"] += 1
+            elif change_pct < 0:
+                stat["declines"] += 1
+            else:
+                stat["unchanged"] += 1
+
+    sector_list = []
+    for stat in sector_stats.values():
+        changes = stat.pop("_changes")
+        stat["average_change_percent"] = round(sum(changes) / len(changes), 4) if changes else None
+        sector_list.append(stat)
+    sector_list.sort(key=lambda item: (item["average_change_percent"] is not None, item["average_change_percent"] or 0), reverse=True)
+
+    return {
+        "source": "groww",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "total_stocks": len(items),
+        "advances": advances,
+        "declines": declines,
+        "unchanged": unchanged,
+        "sectors": sector_list,
+        "stocks": items,
+    }
 
 
 @app.get("/api/v1/stocks/{symbol}")
