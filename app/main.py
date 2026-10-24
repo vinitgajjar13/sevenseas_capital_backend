@@ -28,7 +28,7 @@ def _normalize_ohlc(value):
             parsed = {}
             for field in ("open", "high", "low", "close", "volume"):
                 match = re.search(
-                    rf"{field}\\s*:\\s*([-+]?(?:\\d+(?:\\.\\d*)?|\\.\\d+))",
+                    rf"{field}\s*:\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+))",
                     value,
                     re.IGNORECASE,
                 )
