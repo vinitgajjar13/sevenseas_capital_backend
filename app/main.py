@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,6 +16,35 @@ from app.market_data.groww import GrowwService
 from app.routers.groww import router as groww_router, set_groww_service
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_ohlc(value):
+    """Normalize Groww SDK OHLC responses, which may be dicts or serialized strings."""
+    parsed = value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            parsed = {}
+            for field in ("open", "high", "low", "close", "volume"):
+                match = re.search(
+                    rf"{field}\\s*:\\s*([-+]?(?:\\d+(?:\\.\\d*)?|\\.\\d+))",
+                    value,
+                    re.IGNORECASE,
+                )
+                if match:
+                    parsed[field] = match.group(1)
+    if not isinstance(parsed, dict):
+        return {}
+    normalized = {}
+    for field in ("open", "high", "low", "close", "volume"):
+        raw = parsed.get(field)
+        try:
+            normalized[field] = float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            normalized[field] = None
+    return normalized
+
 
 settings = get_settings()
 app = FastAPI(
@@ -161,7 +191,7 @@ async def market_overview(
         symbol = (stock.groww_symbol or stock.symbol).replace("NSE-", "").replace("BSE-", "").strip().upper()
         key = f"NSE_{symbol}"
         ltp = ltp_map.get(key, ltp_map.get(symbol))
-        bar = ohlc_map.get(key, ohlc_map.get(symbol, {})) or {}
+        bar = _normalize_ohlc(ohlc_map.get(key, ohlc_map.get(symbol, {})) or {})
         close = bar.get("close")
         change = round(float(ltp) - float(close), 4) if ltp is not None and close not in (None, 0) else None
         change_pct = round(change / float(close) * 100, 4) if change is not None and close not in (None, 0) else None
