@@ -229,9 +229,18 @@ class GrowwService:
     async def connect(self, instruments: list[dict]):
         """
         Connect to GrowwFeed live stream for a list of instruments.
-        instruments format: [{"exchange": "NSE", "segment": "CASH", "exchange_token": "..."}]
+
+        Groww's SDK creates and runs its own event loop inside GrowwFeed/NatsClient.
+        That constructor must not run on FastAPI's active event-loop thread, so the
+        complete synchronous feed lifecycle is run on a worker thread.
         """
         self.ensure_authenticated()
+
+        # Both /api/v1/market/connect and the Groww router can request a connection.
+        # Do not create multiple SDK feeds for the same service instance.
+        if getattr(self, "_feed_started", False):
+            return
+        self._feed_started = True
         loop = asyncio.get_running_loop()
 
         def on_data_received(meta=None):
@@ -257,8 +266,20 @@ class GrowwService:
                         }
                         asyncio.run_coroutine_threadsafe(self.publisher.publish_tick(tick), loop)
             except Exception:
-                pass
+                # A malformed individual tick should not terminate the SDK feed.
+                return
 
-        self.feed = GrowwFeed(self.groww)
-        self.feed.subscribe_ltp(instruments, on_data_received=on_data_received)
-        await asyncio.to_thread(self.feed.consume)
+        def run_feed():
+            # Keep construction, subscription, and consume on the same worker thread.
+            # GrowwFeed's NATS client runs a private event loop during construction.
+            self.feed = GrowwFeed(self.groww)
+            self.feed.subscribe_ltp(instruments, on_data_received=on_data_received)
+            self.feed.consume()
+
+        try:
+            await asyncio.to_thread(run_feed)
+        except Exception:
+            self.feed = None
+            self._feed_started = False
+            import logging
+            logging.getLogger(__name__).exception("Groww live feed failed to start")
