@@ -65,5 +65,63 @@ class TestMarketAPI(unittest.TestCase):
             self.assertIsNone(v["price"])
             self.assertIsNone(v["previousClose"])
 
+    def test_market_overview_and_radar_compatibility(self):
+        """Verify /api/v1/market/overview and /api/v1/market/radar responses have all required strategy fields."""
+        from unittest.mock import patch, AsyncMock
+        from fastapi.testclient import TestClient
+        from app.main import app
+
+        with patch("app.main.groww.get_batch_prices_cached", new_callable=AsyncMock) as mock_batch, \
+             patch("app.main.groww.get_ohlc_cached", new_callable=AsyncMock) as mock_ohlc:
+
+            mock_batch.return_value = {
+                "ltp": {"NSE_BHEL": 425.0, "NSE_MFSL": 1450.0}
+            }
+            mock_ohlc.return_value = {
+                "NSE_BHEL": {"open": 418.0, "high": 426.0, "low": 417.0, "close": 415.0, "volume": 500000},
+                "NSE_MFSL": {"open": 1400.0, "high": 1460.0, "low": 1395.0, "close": 1410.0, "volume": 300000},
+            }
+
+            with TestClient(app) as client:
+                # 1. Test /api/v1/market/overview
+                res = client.get("/api/v1/market/overview?limit=5")
+                self.assertEqual(res.status_code, 200)
+                data = res.json()
+
+                # Verify top-level structure
+                for expected_key in ("source", "updated_at", "total_stocks", "advances", "declines", "sectors", "stocks"):
+                    self.assertIn(expected_key, data)
+
+                # Verify strategy summary keys
+                self.assertIn("bullish_watch_count", data)
+                self.assertIn("bearish_watch_count", data)
+                self.assertIn("spike_count", data)
+                self.assertIn("dump_count", data)
+
+                # Verify stock item strategy fields
+                if data["stocks"]:
+                    stock = data["stocks"][0]
+                    # Preserved backward-compatible fields
+                    for field in ("id", "symbol", "name", "sector", "ltp", "change", "change_percent", "volume"):
+                        self.assertIn(field, stock)
+                    # New strategy fields
+                    for field in ("bullish_watch", "bearish_watch", "signal", "action", "strategy_state", "has_reference_data"):
+                        self.assertIn(field, stock)
+
+                # Verify sector item strategy fields
+                if data["sectors"]:
+                    sector = data["sectors"][0]
+                    for field in ("sector", "total", "advances", "declines", "average_change_percent", "direction", "score", "top_bullish_stocks", "top_bearish_stocks"):
+                        self.assertIn(field, sector)
+
+                # 2. Test /api/v1/market/radar
+                radar_res = client.get("/api/v1/market/radar")
+                self.assertEqual(radar_res.status_code, 200)
+                radar_data = radar_res.json()
+                for key in ("market_status", "price_type", "summary", "top_bullish_sectors", "top_bearish_sectors", "sectors", "watch_stocks", "spike_dump_stocks", "teacher_guidance"):
+                    self.assertIn(key, radar_data)
+
+
 if __name__ == "__main__":
     unittest.main()
+

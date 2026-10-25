@@ -10,14 +10,18 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.db.session import engine, get_db, SessionLocal
-from app.db.models import Base, Stock, Sector
+from app.db.models import Base, Stock, Sector, MarketSession
 from app.schemas.api import StockOut
 from app.services.live_state import LiveState
 from app.market_data.groww import GrowwService
 from app.routers.groww import router as groww_router, set_groww_service
 from app.routers.auth import router as auth_router
+from app.strategies.engine import StrategyEngine, StockContext
+from app.strategies.sector import calculate_sector_snapshot, assign_sector_ranks
 
 logger = logging.getLogger(__name__)
+strategy_engine = StrategyEngine()
+
 
 
 def _normalize_ohlc(value):
@@ -91,7 +95,7 @@ async def background_market_poller():
                 async with SessionLocal() as db:
                     stocks = (
                         await db.scalars(
-                            select(Stock).where(Stock.active == True).limit(50)
+                            select(Stock).where(Stock.active == True).order_by(Stock.symbol)
                         )
                     ).all()
 
@@ -100,20 +104,23 @@ async def background_market_poller():
                     token_map = {s.symbol.upper(): (s.groww_exchange_token or s.instrument_token or s.symbol) for s in stocks}
 
                     try:
-                        batch_res = await groww.get_batch_prices_cached(symbols=symbols, exchange="NSE", segment="CASH")
-                        ltp_map = batch_res.get("ltp", {})
-                        for raw_key, price in ltp_map.items():
-                            sym = raw_key.replace("NSE_", "").upper()
-                            token = token_map.get(sym, sym)
-                            await live.publish_tick({
-                                "instrument_token": token,
-                                "exchange_token": token,
-                                "symbol": sym,
-                                "last_price": price,
-                                "ltp": price,
-                                "marketStatus": status_info["marketStatus"],
-                                "priceType": status_info["priceType"],
-                            })
+                        # Batch in 50-symbol chunks compliant with Groww API limits
+                        for offset in range(0, len(symbols), 50):
+                            batch_syms = symbols[offset : offset + 50]
+                            batch_res = await groww.get_batch_prices_cached(symbols=batch_syms, exchange="NSE", segment="CASH")
+                            ltp_map = batch_res.get("ltp", {})
+                            for raw_key, price in ltp_map.items():
+                                sym = raw_key.replace("NSE_", "").upper()
+                                token = token_map.get(sym, sym)
+                                await live.publish_tick({
+                                    "instrument_token": token,
+                                    "exchange_token": token,
+                                    "symbol": sym,
+                                    "last_price": price,
+                                    "ltp": price,
+                                    "marketStatus": status_info["marketStatus"],
+                                    "priceType": status_info["priceType"],
+                                })
                     except Exception as e:
                         logger.debug(f"Background LTP poll error: {e}")
 
@@ -175,13 +182,11 @@ async def market_overview(
     limit: int = Query(250, ge=1, le=500, description="Maximum active stocks to include"),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return real Groww LTP/OHLC data joined to the configured stock and sector universe.
+    """Return real Groww LTP/OHLC data joined to the configured stock and sector universe,
 
-    Strategy scores and signals are intentionally not fabricated here; this endpoint
-    only returns values supplied by Groww plus simple change calculations from OHLC.
+    evaluated through the exact Excel trading strategy rules (WATCH setups, SPIKE/DUMP signals,
+    and sector strength/breadth).
     """
-    from app.db.models import Sector
-
     stocks = (
         await db.scalars(
             select(Stock).where(Stock.active == True).order_by(Stock.symbol).limit(limit)
@@ -195,9 +200,27 @@ async def market_overview(
             "advances": 0,
             "declines": 0,
             "unchanged": 0,
+            "bullish_watch_count": 0,
+            "bearish_watch_count": 0,
+            "spike_count": 0,
+            "dump_count": 0,
             "stocks": [],
             "sectors": [],
         }
+
+    # Query latest MarketSession reference data (PD-3:25 levels & 9:15 AM OHLC)
+    stock_ids = [s.id for s in stocks]
+    session_rows = (
+        await db.scalars(
+            select(MarketSession)
+            .where(MarketSession.stock_id.in_(stock_ids))
+            .order_by(MarketSession.trading_date.desc())
+        )
+    ).all()
+    session_map = {}
+    for s_row in session_rows:
+        if s_row.stock_id not in session_map:
+            session_map[s_row.stock_id] = s_row
 
     symbols = [
         (s.groww_symbol or s.symbol).replace("NSE-", "").replace("BSE-", "").strip().upper()
@@ -215,7 +238,9 @@ async def market_overview(
     sector_names = {sector.id: sector.name for sector in sectors}
     items = []
     advances = declines = unchanged = 0
-    sector_stats = {}
+    bullish_watch_count = bearish_watch_count = 0
+    spike_count = dump_count = 0
+    sector_grouped_stocks = {}
 
     for stock in stocks:
         symbol = (stock.groww_symbol or stock.symbol).replace("NSE-", "").replace("BSE-", "").strip().upper()
@@ -233,7 +258,35 @@ async def market_overview(
             unchanged += 1
 
         sector_name = sector_names.get(stock.sector_id, "Unclassified")
+        ms = session_map.get(stock.id)
+
+        # Build StockContext with verified Excel reference levels
+        ctx = StockContext(
+            symbol=stock.symbol,
+            current=float(ltp) if ltp is not None else None,
+            change_pct=change_pct,
+            volume=int(bar.get("volume")) if bar.get("volume") is not None else (ms.volume if ms else 0),
+            pd_high=ms.pd_325_high if ms else None,
+            pd_low=ms.pd_325_low if ms else None,
+            open_915=ms.open_915 if ms else None,
+            high_915=ms.high_915 if ms else None,
+            low_915=ms.low_915 if ms else None,
+            close_915=ms.close_915 if ms else None,
+            prev_close=float(close) if close is not None else None,
+        )
+        strat = strategy_engine.evaluate(ctx)
+
+        if strat["bullish_watch"]:
+            bullish_watch_count += 1
+        if strat["bearish_watch"]:
+            bearish_watch_count += 1
+        if strat["signal"] == "🔥 SPIKE":
+            spike_count += 1
+        elif strat["signal"] == "🚨 DUMP":
+            dump_count += 1
+
         item = {
+            # Preserved backward-compatible fields
             "id": stock.id,
             "symbol": stock.symbol,
             "name": stock.name,
@@ -249,28 +302,44 @@ async def market_overview(
             "high": bar.get("high"),
             "low": bar.get("low"),
             "previous_close": close,
-            "volume": bar.get("volume"),
+            "volume": bar.get("volume") if bar.get("volume") is not None else (ms.volume if ms else None),
             "data_source": "groww" if ltp is not None else "unavailable",
+            # Excel Strategy Fields
+            "change_percent_915": strat["change_pct_915"],
+            "bullish_watch": strat["bullish_watch"],
+            "bearish_watch": strat["bearish_watch"],
+            "watch_status": strat["watch_status"],
+            "signal": strat["signal"],
+            "action": strat["action"],
+            "strategy_state": strat["state"],
+            "score": strat["score"],
+            "special_bullish": strat["special_bullish"],
+            "special_bearish": strat["special_bearish"],
+            "has_reference_data": strat["has_reference_data"],
+            # Reference levels for auditability
+            "pd_high": ms.pd_325_high if ms else None,
+            "pd_low": ms.pd_325_low if ms else None,
+            "open_915": ms.open_915 if ms else None,
+            "close_915": ms.close_915 if ms else None,
         }
         items.append(item)
 
-        stat = sector_stats.setdefault(sector_name, {"sector": sector_name, "total": 0, "advances": 0, "declines": 0, "unchanged": 0, "average_change_percent": 0.0, "_changes": []})
-        stat["total"] += 1
-        if change_pct is not None:
-            stat["_changes"].append(change_pct)
-            if change_pct > 0:
-                stat["advances"] += 1
-            elif change_pct < 0:
-                stat["declines"] += 1
-            else:
-                stat["unchanged"] += 1
+        # Group for sector calculations (use 9:15 change_pct if available, else standard change_pct)
+        sec_item = {
+            "symbol": stock.symbol,
+            "current_price": float(ltp) if ltp is not None else None,
+            "change_pct": strat["change_pct_915"] if strat["change_pct_915"] is not None else change_pct,
+            "volume": item["volume"] or 0,
+        }
+        sector_grouped_stocks.setdefault(sector_name, []).append(sec_item)
 
+    # Calculate exact Excel Sector Dashboard metrics & rankings
     sector_list = []
-    for stat in sector_stats.values():
-        changes = stat.pop("_changes")
-        stat["average_change_percent"] = round(sum(changes) / len(changes), 4) if changes else None
-        sector_list.append(stat)
-    sector_list.sort(key=lambda item: (item["average_change_percent"] is not None, item["average_change_percent"] or 0), reverse=True)
+    for s_name, sec_stocks in sector_grouped_stocks.items():
+        snap = calculate_sector_snapshot(sec_stocks, sector_name=s_name)
+        sector_list.append(snap)
+
+    sector_list = assign_sector_ranks(sector_list)
 
     return {
         "source": "groww",
@@ -279,8 +348,53 @@ async def market_overview(
         "advances": advances,
         "declines": declines,
         "unchanged": unchanged,
+        "bullish_watch_count": bullish_watch_count,
+        "bearish_watch_count": bearish_watch_count,
+        "spike_count": spike_count,
+        "dump_count": dump_count,
         "sectors": sector_list,
         "stocks": items,
+    }
+
+
+@app.get("/api/v1/market/radar")
+async def market_radar(db: AsyncSession = Depends(get_db)):
+    """Dedicated endpoint returning the complete Excel Radar, Sector Ranks, and Live Market Teacher analysis."""
+    overview = await market_overview(limit=500, db=db)
+    status_info = get_market_status()
+
+    sectors = overview.get("sectors", [])
+    stocks = overview.get("stocks", [])
+
+    top_bullish_sectors = [s for s in sectors if s.get("bullish_rank") is not None]
+    top_bullish_sectors.sort(key=lambda s: s["bullish_rank"])
+
+    top_bearish_sectors = [s for s in sectors if s.get("bearish_rank") is not None]
+    top_bearish_sectors.sort(key=lambda s: s["bearish_rank"])
+
+    watch_stocks = [s for s in stocks if s.get("watch_status")]
+    spike_dump_stocks = [s for s in stocks if s.get("signal") in ("🔥 SPIKE", "🚨 DUMP")]
+    teacher_stocks = [s for s in stocks if s.get("action") not in (None, "⚪ WATCH / WAIT")]
+
+    return {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "market_status": status_info["marketStatus"],
+        "price_type": status_info["priceType"],
+        "summary": {
+            "total_stocks": overview.get("total_stocks", 0),
+            "advances": overview.get("advances", 0),
+            "declines": overview.get("declines", 0),
+            "bullish_watch_count": overview.get("bullish_watch_count", 0),
+            "bearish_watch_count": overview.get("bearish_watch_count", 0),
+            "spike_count": overview.get("spike_count", 0),
+            "dump_count": overview.get("dump_count", 0),
+        },
+        "top_bullish_sectors": top_bullish_sectors[:3],
+        "top_bearish_sectors": top_bearish_sectors[:3],
+        "sectors": sectors,
+        "watch_stocks": watch_stocks,
+        "spike_dump_stocks": spike_dump_stocks,
+        "teacher_guidance": teacher_stocks,
     }
 
 
